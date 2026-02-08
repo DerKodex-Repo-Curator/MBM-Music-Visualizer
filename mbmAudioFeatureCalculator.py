@@ -1,7 +1,6 @@
 # MBM's Music Visualizer: Audio Feature Calculator
 # Calculates relevant audio features from loaded audio.
 
-# Imports
 import librosa
 import torch
 import numpy as np
@@ -11,12 +10,12 @@ from scipy.signal import resample
 
 from .mbmMVShared import normalizeArray, chartData, renderChart
 
-# Classes
+
 class AudioFeatureCalculator:
     """
     Calculates relevant audio features from loaded audio.
     """
-    # Class Constants
+
     DEF_FEAT_MOD_MAX = 10000.0
     DEF_FEAT_MOD_MIN = -10000.0
 
@@ -25,253 +24,231 @@ class AudioFeatureCalculator:
     FUNCTION = "process"
     CATEGORY = "MBMnodes/Audio"
 
-    # Constructor
     def __init__(self):
         pass
 
-    # ComfyUI Functions
     @classmethod
     def INPUT_TYPES(s):
         return {
             "required": {
-                "audio": ("AUDIO", ),
-                "intensity": ("FLOAT", {"default": 1.0}), # Muiltiplier for the audio features
+                "audio": ("AUDIO",),
+                "intensity": ("FLOAT", {"default": 1.0}),
                 "hop_length": ("INT", {"default": 512}),
-                "fps_target": ("FLOAT", {"default": 6, "min": -1, "max": 10000}), # Provide `<= 0` to use whatever audio sampling comes up with
-                "feat_mod_max": ("FLOAT", {"default": s.DEF_FEAT_MOD_MAX, "min": -10000.0, "max": 10000.0}), # The maximum value the feature modifier can be. 10,000 should be unattainable through normal usage.
-                "feat_mod_min": ("FLOAT", {"default": s.DEF_FEAT_MOD_MIN, "min": -10000.0, "max": 10000.0}), # The minimum value the feature modifier can be. -10,000 should be unattainable through normal usage.
-                "feat_mod_normalize": ([False, True], ), # If `True`, the feature modifier array will be normalized between 0 and the maximum value in the array.
+                "fps_target": ("FLOAT", {"default": 6, "min": -1, "max": 10000}),
+                "feat_mod_max": ("FLOAT", {"default": s.DEF_FEAT_MOD_MAX}),
+                "feat_mod_min": ("FLOAT", {"default": s.DEF_FEAT_MOD_MIN}),
+                "feat_mod_normalize": ([False, True],),
             }
         }
 
-    def process(self,
-            audio: tuple,
-            intensity: float,
-            hop_length: int,
-            fps_target: float,
-            feat_mod_max: float,
-            feat_mod_min: float,
-            feat_mod_normalize: bool
-        ):
-        ## Validation
-        # Make sure the feature modifier values are valid
+    def process(
+        self,
+        audio,
+        intensity: float,
+        hop_length: int,
+        fps_target: float,
+        feat_mod_max: float,
+        feat_mod_min: float,
+        feat_mod_normalize: bool,
+    ):
+        # -----------------------
+        # Validation
+        # -----------------------
         if feat_mod_max < feat_mod_min:
-            raise ValueError("The maximum feature modifier value must be greater than the minimum feature modifier value.")
+            raise ValueError("feat_mod_max must be >= feat_mod_min")
 
         if feat_mod_max == self.DEF_FEAT_MOD_MAX:
             feat_mod_max = None
-
         if feat_mod_min == self.DEF_FEAT_MOD_MIN:
             feat_mod_min = None
 
-        ## Calculation
-        # Unpack the audio
-        #y, sr = audio
-
-        # Calculate the duration of the audio
-        #duration = librosa.get_duration(y=y, sr=sr, hop_length=hop_length)
-
-        # --- Accept multiple ComfyUI audio formats ---
-        # Expected by MBM: audio = (y, sr)
-        # But sometimes ComfyUI nodes pass: filename (str) or dict-like audio objects.
-
+        # -----------------------
+        # Load audio (robusto)
+        # -----------------------
         if isinstance(audio, str):
-            # audio is a filepath/filename
             y, sr = librosa.load(audio, sr=None, mono=True)
-        elif isinstance(audio, dict) and ("waveform" in audio) and ("sample_rate" in audio):
-            # audio is ComfyUI-style dict
+
+        elif isinstance(audio, dict):
             sr = int(audio["sample_rate"])
             y = audio["waveform"]
-
-            # waveform may be torch tensor [C, N] or [1, N]
             if hasattr(y, "detach"):
                 y = y.detach().cpu().numpy()
-            y = np.asarray(y).squeeze()
+
         else:
-            # MBM format: tuple(y, sr)
             y, sr = audio
+            if hasattr(y, "detach"):
+                y = y.detach().cpu().numpy()
 
-        # Calculate the duration of the audio
+        # -----------------------
+        # FORCE MONO 1D
+        # -----------------------
+        y = np.asarray(y, dtype=np.float32)
+
+        if y.ndim == 2:
+            # (channels, samples) → mono
+            y = librosa.to_mono(y)
+
+        y = y.reshape(-1)
+
+        # -----------------------
+        # Duration
+        # -----------------------
         duration = librosa.get_duration(y=y, sr=sr, hop_length=hop_length)
-        # --- end patch ---
 
+        # -----------------------
+        # TEMPO (1D)
+        # -----------------------
+        onset = librosa.onset.onset_strength(y=y, sr=sr, hop_length=hop_length)
+        tempo = librosa.beat.tempo(
+            onset_envelope=onset,
+            sr=sr,
+            hop_length=hop_length,
+            aggregate=None,
+        )
+        tempo = normalizeArray(np.asarray(tempo).reshape(-1))
 
-        # # Calculate the duration of a single hop
-        # hopSeconds: float = (hop_length / sr)
-
-        # Calculate tempo
-        onset = librosa.onset.onset_strength(y=y, sr=sr)
-        tempo = normalizeArray(librosa.beat.tempo(onset_envelope=onset, sr=sr, hop_length=hop_length, aggregate=None))
-
-        # Calculate the spectrogram
+        # -----------------------
+        # MEL SPECTROGRAM → MEAN (1D)
+        # -----------------------
         spectro = librosa.feature.melspectrogram(
             y=y,
             sr=sr,
             n_mels=128,
             fmax=8000,
-            hop_length=hop_length
+            hop_length=hop_length,
         )
 
-        # Calculate normalized mean power per hop
-        spectroMean = np.mean(spectro, axis=0)
-
-        # Calculate the delta of the spectrogram mean
-        spectroMeanDelta = librosa.feature.delta(spectroMean)
-
-        # Normalize the spectro mean
+        spectroMean = np.mean(spectro, axis=0).reshape(-1)
         spectroMean = normalizeArray(spectroMean)
 
-        # Calculate pitch chroma for hops
-        chroma = librosa.feature.chroma_cqt(
-            y=y,
-            sr=sr,
-            hop_length=hop_length
-        )
+        # DELTA (FORZADO 1D)
+        spectroMeanDelta = librosa.feature.delta(spectroMean[None, :])[0]
+        spectroMeanDelta = spectroMeanDelta.reshape(-1)
 
-        # Get the mean of the chroma for each step
-        chromaMean = np.mean(chroma, axis=0)
+        # -----------------------
+        # CHROMA → MEAN (1D)
+        # -----------------------
+        chroma = librosa.feature.chroma_cqt(y=y, sr=sr, hop_length=hop_length)
+        chromaMean = np.mean(chroma, axis=0).reshape(-1)
 
-        # Calculate the output FPS
+        # -----------------------
+        # FPS / FRAMES
+        # -----------------------
         if fps_target <= 0:
-            # Calculate framerate based on audio
             fps = len(tempo) / duration
         else:
-            # Specific framerate to target
             fps = fps_target
 
-        # Calculate desired frame count
-        desiredFrames = round(fps * duration)
+        desiredFrames = max(1, round(fps * duration))
 
-        # Resample audio features to match desired frame count
+        # -----------------------
+        # RESAMPLE (TODO 1D)
+        # -----------------------
         tempo = resample(tempo, desiredFrames)
         spectroMean = resample(spectroMean, desiredFrames)
         spectroMeanDelta = resample(spectroMeanDelta, desiredFrames)
         chromaMean = resample(chromaMean, desiredFrames)
 
-        # Calculate the feature modifier for each frame
-        featModifiers = torch.Tensor(
-            [self._calcFeatModifier(
-                intensity,
-                tempo[i],
-                spectroMean[i],
-                spectroMeanDelta[i],
-                chromaMean[i],
-                modMax=feat_mod_max,
-                modMin=feat_mod_min
-            ) for i in range(desiredFrames)]
+        # -----------------------
+        # FEATURE MODIFIER (1D)
+        # -----------------------
+        featModifiers = torch.tensor(
+            [
+                self._calcFeatModifier(
+                    intensity,
+                    tempo[i],
+                    spectroMean[i],
+                    spectroMeanDelta[i],
+                    chromaMean[i],
+                    modMax=feat_mod_max,
+                    modMin=feat_mod_min,
+                )
+                for i in range(desiredFrames)
+            ],
+            dtype=torch.float32,
         )
 
-        # Normalize the feature modifiers if requested
         if feat_mod_normalize:
-            # NOTE: The feat_mod_max and feat_mod_min values will be inaccurate realtive to the now normalized featModifiers array and must be adjusted if used later.
-            featModifiers = normalizeArray(featModifiers, minVal=0.0, maxVal=featModifiers.max().item())
+            featModifiers = normalizeArray(
+                featModifiers,
+                minVal=0.0,
+                maxVal=float(featModifiers.max()),
+            )
 
-        # Build the charts
-        chartImages = torch.vstack([
-            chartData(tempo, "Tempo"),
-            chartData(spectroMean, "Spectrogram Mean"),
-            chartData(spectroMeanDelta, "Spectrogram Mean Delta"),
-            chartData(chromaMean, "Chroma Mean"),
-            self._chartFeatMod(featModifiers, intensity, feat_mod_normalize, modMax=feat_mod_max, modMin=feat_mod_min)
-        ])
+        # -----------------------
+        # CHARTS
+        # -----------------------
+        chartImages = torch.vstack(
+            [
+                chartData(tempo, "Tempo"),
+                chartData(spectroMean, "Spectrogram Mean"),
+                chartData(spectroMeanDelta, "Spectrogram Mean Delta"),
+                chartData(chromaMean, "Chroma Mean"),
+                self._chartFeatMod(
+                    featModifiers,
+                    intensity,
+                    feat_mod_normalize,
+                    modMax=feat_mod_max,
+                    modMin=feat_mod_min,
+                ),
+            ]
+        )
 
         return (
-            featModifiers,
-            (duration / desiredFrames),
+            featModifiers,                # 1D tensor ✔
+            duration / desiredFrames,     # seconds per frame
             fps,
-            chartImages
+            chartImages,
         )
-    
-    # Internal Functions
-    def _calcFeatModifier(self,
-            intensity: float,
-            tempo: float,
-            spectroMean: float,
-            spectroMeanDelta: float,
-            chromaMean: float,
-            modMax: Optional[float] = None,
-            modMin: Optional[float] = None
-        ) -> float:
-        """
-        Calculates the overall feature modifier based on the provided audio features.
 
-        intensity: A modifier to increase (>1.0) or decrease (<1.0) the overall effect of the audio features.
-        tempo: The tempo for a single step of the audio.
-        spectroMean: The normalized mean power for a single step of the audio.
-        spectroMeanDelta: The delta of the normalized mean power for a single step of the audio.
-        chromaMean: The mean value of the chroma for a single step of the audio.
-        modMax: The maximum value the feature modifier can be. Provide `None` to have no maximum.
-        modMin: The minimum value the feature modifier can be. Provide `None` to have no minimum.
+    # ------------------------------------------------------------------
 
-        Returns the calculated overall feature modifier.
-        """
-        modVal = (((tempo + 1.0) * (spectroMean + 1.0) * (chromaMean + 1.0)) * (intensity + spectroMeanDelta))
+    def _calcFeatModifier(
+        self,
+        intensity: float,
+        tempo: float,
+        spectroMean: float,
+        spectroMeanDelta: float,
+        chromaMean: float,
+        modMax: Optional[float] = None,
+        modMin: Optional[float] = None,
+    ) -> float:
+        modVal = (
+            (tempo + 1.0)
+            * (spectroMean + 1.0)
+            * (chromaMean + 1.0)
+            * (intensity + spectroMeanDelta)
+        )
 
-        if (modMax is not None) and (modVal > modMax):
+        if modMax is not None and modVal > modMax:
             return modMax
-        elif (modMin is not None) and (modVal < modMin):
+        if modMin is not None and modVal < modMin:
             return modMin
-        else:
-            return modVal
+        return modVal
 
-    def _chartFeatMod(self,
-            featModifiers: torch.Tensor,
-            intensity: float,
-            isNormalized: bool,
-            modMax: Optional[float] = None,
-            modMin: Optional[float] = None
-        ) -> torch.Tensor:
-        """
-        Creates a chart representing the feature modifier.
+    # ------------------------------------------------------------------
 
-        featModifiers: The calculated feature modifiers.
-        intensity: The given intensity used in calculating the feature modifiers.
-        isNormalized: If the feature modifiers are normalized.
-        modMax: The maximum value the feature modifier can be. Provide `None` to display no maximum.
-        modMin: The minimum value the feature modifier can be. Provide `None` to display no minimum.
+    def _chartFeatMod(
+        self,
+        featModifiers: torch.Tensor,
+        intensity: float,
+        isNormalized: bool,
+        modMax: Optional[float] = None,
+        modMin: Optional[float] = None,
+    ) -> torch.Tensor:
 
-        Returns a ComfyUI compatible Tensor image of the chart.
-        """
-        # Build the chart
         fig, ax = plt.subplots(figsize=(20, 4))
-
         ax.plot(featModifiers, label="Modifiers")
 
-        modMaxStr = "none"
         if modMax is not None:
-            if isNormalized:
-                # Use logical value
-                modMaxAlt = featModifiers.max().item()
-                modMaxStr = f"{modMaxAlt:.2f} ({modMax:.2f})"
-                plt.axhline(y=modMaxAlt, linestyle="dotted", color="yellow", label="Mod Max")
-            else:
-                # Use prescribed value
-                modMaxStr = f"{modMax:.2f}"
-                plt.axhline(y=modMax, linestyle="dotted", color="yellow", label="Mod Max")
-
-        modMinStr = "none"
+            ax.axhline(y=featModifiers.max() if isNormalized else modMax, linestyle="dotted")
         if modMin is not None:
-            if isNormalized:
-                # Use logical value
-                modMinStr = f"0 ({modMin:.2f})"
-                plt.axhline(y=0, linestyle="dotted", color="green", label="Mod Min")
-            else:
-                # Use prescribed value
-                modMinStr = f"{modMin:.2f}"
-                plt.axhline(y=modMin, linestyle="dotted", color="green", label="Mod Min")
+            ax.axhline(y=0 if isNormalized else modMin, linestyle="dotted")
 
-        ax.legend()
-        ax.grid(True)
         ax.set_title("Feature Modifiers")
         ax.set_xlabel("Index")
         ax.set_ylabel("Value")
+        ax.legend()
+        ax.grid(True)
 
-        # Add feature information
-        featureInfo = f"Normalized: {('yes' if isNormalized else 'no')}\n"
-        featureInfo += f"Max: {modMaxStr}\n"
-        featureInfo += f"Min: {modMinStr}\n"
-        featureInfo += f"Intensity: {intensity:.2f}"
-        ax.text(1.02, 0.5, featureInfo, transform=ax.transAxes, va="center")
-
-        # Render the chart
         return renderChart(fig)
