@@ -66,10 +66,35 @@ class AudioFeatureCalculator:
 
         ## Calculation
         # Unpack the audio
-        y, sr = audio
+        #y, sr = audio
+
+        # Calculate the duration of the audio
+        #duration = librosa.get_duration(y=y, sr=sr, hop_length=hop_length)
+
+        # --- Accept multiple ComfyUI audio formats ---
+        # Expected by MBM: audio = (y, sr)
+        # But sometimes ComfyUI nodes pass: filename (str) or dict-like audio objects.
+
+        if isinstance(audio, str):
+            # audio is a filepath/filename
+            y, sr = librosa.load(audio, sr=None, mono=True)
+        elif isinstance(audio, dict) and ("waveform" in audio) and ("sample_rate" in audio):
+            # audio is ComfyUI-style dict
+            sr = int(audio["sample_rate"])
+            y = audio["waveform"]
+
+            # waveform may be torch tensor [C, N] or [1, N]
+            if hasattr(y, "detach"):
+                y = y.detach().cpu().numpy()
+            y = np.asarray(y).squeeze()
+        else:
+            # MBM format: tuple(y, sr)
+            y, sr = audio
 
         # Calculate the duration of the audio
         duration = librosa.get_duration(y=y, sr=sr, hop_length=hop_length)
+        # --- end patch ---
+
 
         # # Calculate the duration of a single hop
         # hopSeconds: float = (hop_length / sr)
